@@ -557,7 +557,7 @@ main(int argc, char *argv[])
 	return -1;
     }
 
-    err = sel_alloc_selector(&ser2net_sel);
+    err = sel_alloc_selector2(&ser2net_sel, ser2net_wake_sig);
     if (err) {
 	fprintf(stderr,
 		"Could not initialize ser2net selector: '%s'\n",
