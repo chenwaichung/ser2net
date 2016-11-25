@@ -68,12 +68,13 @@ scan_int(char *str)
    In the absence of a host specification, a wildcard address is used.
    The mandatory second part is the port number or a service name. */
 int
-scan_network_port(char *str, struct addrinfo **rai)
+scan_network_port(char *str, struct addrinfo **rai, bool *is_dgram)
 {
     char *strtok_data, *strtok_buffer;
     char *ip;
     char *port;
     struct addrinfo hints, *ai;
+    int socktype = SOCK_STREAM;
 
     strtok_buffer = strdup(str);
     if (!strtok_buffer)
@@ -86,10 +87,20 @@ scan_network_port(char *str, struct addrinfo **rai)
 	ip = NULL;
     }
 
+    if (is_dgram) {
+	if (port[0] == 'u') {
+	    port++;
+	    socktype = SOCK_DGRAM;
+	    *is_dgram = true;
+	} else {
+	    *is_dgram = false;
+	}
+    }
+
     memset(&hints, 0, sizeof(hints));
     hints.ai_flags = AI_PASSIVE;
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_socktype = socktype;
     if (getaddrinfo(ip, port, &hints, &ai)) {
 	free(strtok_buffer);
 	return EINVAL;
@@ -115,7 +126,8 @@ check_ipv6_only(int family, struct sockaddr *addr, int fd)
 }
 
 int *
-open_socket(struct addrinfo *ai, void (*readhndlr)(int, void *), void *data,
+open_socket(struct addrinfo *ai, void (*readhndlr)(int, void *),
+	    void (*writehndlr)(int, void *), void *data,
 	    unsigned int *nr_fds, void (*fd_handler_cleared)(int, void *))
 {
     struct addrinfo *rp;
@@ -153,11 +165,11 @@ open_socket(struct addrinfo *ai, void (*readhndlr)(int, void *), void *data,
 	if (bind(fds[curr_fd], rp->ai_addr, rp->ai_addrlen) != 0)
 	    goto next;
 
-	if (listen(fds[curr_fd], 1) != 0)
+	if (rp->ai_socktype == SOCK_STREAM && listen(fds[curr_fd], 1) != 0)
 	    goto next;
 
 	sel_set_fd_handlers(ser2net_sel, fds[curr_fd], data,
-			    readhndlr, NULL, NULL, fd_handler_cleared);
+			    readhndlr, writehndlr, NULL, fd_handler_cleared);
 	sel_set_fd_read_handler(ser2net_sel, fds[curr_fd],
 				SEL_FD_HANDLER_ENABLED);
 	curr_fd++;
