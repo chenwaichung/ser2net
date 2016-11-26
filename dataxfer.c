@@ -94,6 +94,11 @@ struct net_info {
     int            fd;			/* When connected, the file
                                            descriptor for the network
                                            port used for I/O. */
+    bool remote_fixed;			/* Tells if the remote address was
+					   set in the configuration, and
+					   cannot be changed. */
+    bool remote_fixed_port_set;		/* Do port comparison on remote
+					   addresses? */
     struct sockaddr_storage remote;	/* The socket address of who
 					   is connected to this port. */
     struct sockaddr *raddr;		/* Points to remote, for convenience. */
@@ -124,6 +129,16 @@ struct net_info {
     int            timeout_left;	/* The amount of time left (in
 					   seconds) before the timeout
 					   goes off. */
+};
+
+struct port_remaddr
+{
+    char *name;
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    int netcon_num;
+    bool is_port_set;
+    struct port_remaddr *next;
 };
 
 struct port_info
@@ -192,6 +207,8 @@ struct port_info
 
     int (*netread)(int fd, port_info_t *port, int *readerr,
 		   net_info_t **netcon);
+
+    struct port_remaddr *remaddrs;
 
     /* Information about the network port. */
     char               *portname;       /* The name given for the port. */
@@ -1821,7 +1838,7 @@ recalc_port_chardelay(port_info_t *port)
 
 /* Called to set up a new connection's file descriptor. */
 static int
-setup_port(port_info_t *port, net_info_t *netcon)
+setup_port(port_info_t *port, net_info_t *netcon, bool is_reconfig)
 {
     int options;
     struct timeval then;
@@ -1864,7 +1881,8 @@ setup_port(port_info_t *port, net_info_t *netcon)
 #endif /* HAVE_TCPD_H */
     }
 
-    netcon->banner = process_str_to_buf(port, netcon, port->bannerstr);
+    if (!is_reconfig)
+	netcon->banner = process_str_to_buf(port, netcon, port->bannerstr);
     if (netcon->banner)
 	netcon->write_handler = handle_net_fd_banner_write;
     else
@@ -1885,7 +1903,8 @@ setup_port(port_info_t *port, net_info_t *netcon)
 	recalc_port_chardelay(port);
 	port->is_2217 = 0;
 
-	port->devstr = process_str_to_buf(port, netcon, port->openstr);
+	if (!is_reconfig)
+	    port->devstr = process_str_to_buf(port, netcon, port->openstr);
 	if (port->devstr)
 	    port->dev_write_handler = handle_dev_fd_devstr_write;
 	else
@@ -1965,20 +1984,11 @@ is_port_free(char *portname)
 }
 
 static void
-handle_port_accept(port_info_t *port, int fd, net_info_t *netcon)
+handle_port_accept(port_info_t *port, int new_fd, net_info_t *netcon)
 {
-    socklen_t len;
     int optval;
 
-    len = sizeof(netcon->remote);
-
-    netcon->fd = accept(fd, netcon->raddr, &len);
-    if (netcon->fd == -1) {
-	if (errno != EAGAIN && errno != EWOULDBLOCK)
-	    syslog(LOG_ERR, "Could not accept on port %s: %m", port->portname);
-	return;
-    }
-    netcon->raddrlen = len;
+    netcon->fd = new_fd;
 
     optval = 1;
     if (setsockopt(netcon->fd, SOL_SOCKET, SO_KEEPALIVE,
@@ -1986,11 +1996,12 @@ handle_port_accept(port_info_t *port, int fd, net_info_t *netcon)
 	close(netcon->fd);
 	syslog(LOG_ERR, "Could not enable SO_KEEPALIVE on tcp port %s: %m",
 	       port->portname);
+	netcon->fd = -1;
 	return;
     }
 
     /* XXX log netcon->remote */
-    setup_port(port, netcon);
+    setup_port(port, netcon, false);
 }
 
 typedef struct rotator
@@ -2019,9 +2030,19 @@ static void
 handle_rot_port_read(int fd, void *data)
 {
     rotator_t *rot = (rotator_t *) data;
-    struct sockaddr_storage dummy_sockaddr;
-    socklen_t len = sizeof(dummy_sockaddr);
     int i, new_fd;
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(addr);
+    const char *err = "No free port found\r\n";
+
+    /* FIXME - handle remote address interactions. */
+    new_fd = accept(fd, (struct sockaddr *) &addr, &addrlen);
+    if (new_fd == -1) {
+	if (errno != EAGAIN && errno != EWOULDBLOCK)
+	    syslog(LOG_ERR, "Could not accept on rotator %s: %m",
+		   rot->portname);
+	return;
+    }
 
     LOCK(ports_lock);
     i = rot->curr_port;
@@ -2033,7 +2054,7 @@ handle_rot_port_read(int fd, void *data)
 	if (port) {
 	    rot->curr_port = i;
 	    LOCK(port->lock);
-	    handle_port_accept(port, fd, &(port->netcons[0]));
+	    handle_port_accept(port, new_fd, &(port->netcons[0]));
 	    UNLOCK(port->lock);
 	    UNLOCK(ports_lock);
 	    return;
@@ -2041,13 +2062,8 @@ handle_rot_port_read(int fd, void *data)
     } while (i != rot->curr_port);
     UNLOCK(ports_lock);
 
-    new_fd = accept(fd, (struct sockaddr *) &dummy_sockaddr, &len);
-    if (new_fd != -1) {
-	char *err = "No free port found\r\n";
-
-	write_ignore_fail(new_fd, err, strlen(err));
-	close(new_fd);
-    }
+    write_ignore_fail(new_fd, err, strlen(err));
+    close(new_fd);
 }
 
 static void
@@ -2180,7 +2196,9 @@ handle_accept_port_read(int fd, void *data)
 {
     port_info_t *port = (port_info_t *) data;
     char *err = NULL;
-    int i;
+    int i, new_fd;
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(addr);
 
     LOCK(port->lock);
 
@@ -2192,40 +2210,61 @@ handle_accept_port_read(int fd, void *data)
     if (port->dev_to_net_state == PORT_CLOSING)
 	goto out;
 
+    new_fd = accept(fd, (struct sockaddr *) &addr, &addrlen);
+    if (new_fd == -1) {
+	if (errno != EAGAIN && errno != EWOULDBLOCK)
+	    syslog(LOG_ERR, "Could not accept on port %s: %m", port->portname);
+	return;
+    }
+
     for (i = 0; i < port->max_connections; i++) {
-	if (port->netcons[i].fd == -1)
+	if (port->netcons[i].remote_fixed &&
+	    sockaddr_equal((struct sockaddr *) &addr, addrlen,
+			   port->netcons[i].raddr, port->netcons[i].raddrlen,
+			   port->netcons[i].remote_fixed_port_set))
 	    break;
     }
 
     if (i == port->max_connections) {
-	if (port->kickolduser_mode) {
-	    shutdown_port(port, "kicked off, new user is coming\r\n");
-	    /* Wait the port to be unconnected and clean, go back to main loop*/
-	    return;
+	for (i = 0; i < port->max_connections; i++) {
+	    if (port->netcons[i].fd == -1 && !port->netcons[i].remote_fixed)
+		break;
 	}
+    }
+
+    if (i == port->max_connections) {
+	if (port->kickolduser_mode) {
+	    /* Only shutdown non-fixed netcons. */
+	    for (i = 0; i < port->max_connections; i++) {
+		if (port->netcons[i].remote_fixed)
+		    continue;
+
+		shutdown_one_netcon(&(port->netcons[i]),
+				    "kicked off, new user is coming\r\n");
+		/* Wait it to be unconnected and clean, go back to main loop. */
+		return;
+	    }
+	}
+
 	err = "Port already in use\r\n";
     }
 
-    if (!err && is_device_already_inuse(port)) {
+    if (!err && is_device_already_inuse(port))
 	err = "Port's device already in use\r\n";
-    }
 
     if (err != NULL) {
-	struct sockaddr_storage dummy_sockaddr;
-	socklen_t len = sizeof(dummy_sockaddr);
-	int new_fd = accept(fd, (struct sockaddr *) &dummy_sockaddr, &len);
-
 	UNLOCK(port->lock);
-	if (new_fd != -1) {
-	    write_ignore_fail(new_fd, err, strlen(err));
-	    close(new_fd);
-	}
+	write_ignore_fail(new_fd, err, strlen(err));
+	close(new_fd);
 	return;
     }
 
+    memcpy(port->netcons[i].raddr, &addr, addrlen);
+    port->netcons[i].raddrlen = addrlen;
+
     /* We have to hold the ports_lock until after this call so the
        device won't get used (from is_device_already_inuse()). */
-    handle_port_accept(port, fd, &(port->netcons[i]));
+    handle_port_accept(port, new_fd, &(port->netcons[i]));
  out:
     UNLOCK(port->lock);
 }
@@ -2279,20 +2318,33 @@ udp_port_read(int fd, port_info_t *port, int *readerr, net_info_t **rnetcon)
 
     /* No matching port. */
     for (i = 0; i < port->max_connections; i++) {
-	if (port->netcons[i].fd == -1)
+	if (!port->netcons[i].remote_fixed)
+	    continue;
+	if (sockaddr_equal((struct sockaddr *) &remaddr, remaddrlen,
+			   port->netcons[i].raddr, port->netcons[i].raddrlen,
+			   port->netcons[i].remote_fixed_port_set))
 	    break;
     }
 
     if (i == port->max_connections) {
-	if (port->kickolduser_mode)
-	    i = 0; /* Overwrite user 0. */
-	else
-	    err = "Port already in use\r\n";
+	for (i = 0; i < port->max_connections; i++) {
+	    if (port->netcons[i].fd == -1 && !port->netcons[i].remote_fixed)
+		break;
+	}
     }
 
-    if (!err && is_device_already_inuse(port)) {
-	err = "Port's device already in use\r\n";
+    if (i == port->max_connections && port->kickolduser_mode) {
+	for (i = 0; i < port->max_connections; i++) {
+	    if (!port->netcons[i].remote_fixed)
+		break;
+	}
     }
+
+    if (i == port->max_connections)
+	err = "Port already in use\r\n";
+
+    if (!err && is_device_already_inuse(port))
+	err = "Port's device already in use\r\n";
 
     if (!err) {
 	netcon = &(port->netcons[i]);
@@ -2312,7 +2364,7 @@ udp_port_read(int fd, port_info_t *port, int *readerr, net_info_t **rnetcon)
     memcpy(netcon->raddr, &remaddr, remaddrlen);
     netcon->raddrlen = remaddrlen;
 
-    if (setup_port(port, netcon))
+    if (setup_port(port, netcon, false))
 	goto out_ignore;
 
     *rnetcon = netcon;
@@ -2337,9 +2389,68 @@ handle_udp_net_fd_read(int fd, void *data)
     handle_net_fd_read(fd, &(port->netcons[0]));
 }
 
+static void
+process_remaddr(struct absout *eout, port_info_t *port, struct port_remaddr *r,
+		bool is_reconfig)
+{
+    net_info_t *netcon;
+
+    for_each_connection(port, netcon) {
+	int i = 0;
+
+	if (netcon->remote_fixed)
+	    continue;
+	if (port->dgram) {
+	    /* Search for a UDP port that matchis the remote address family. */
+	    for (i = 0; i < port->nr_acceptfds; i++) {
+		if (port->acceptfds[i].family == r->addr.ss_family)
+		    break;
+	    }
+	    if (i == port->nr_acceptfds) {
+		eout->out(eout, "remote address '%s' had no socket with"
+			  " a matching family", r->name);
+		return;
+	    }
+	}
+
+	netcon->remote_fixed = true;
+	memcpy(netcon->raddr, &r->addr, r->addrlen);
+	netcon->raddrlen = r->addrlen;
+	netcon->remote_fixed_port_set = r->is_port_set;
+
+	/* If the port is set, we can go ahead and transmit packets. */
+	if (port->dgram && netcon->remote_fixed_port_set) {
+	    int rv;
+
+	    netcon->fd = dup(port->acceptfds[i].fd);
+	    if (netcon->fd == -1) {
+		eout->out(eout,
+			  "Unable to duplicate fd for remote address '%s'",
+			  r->name);
+		return;
+	    }
+
+	    rv = setup_port(port, netcon, is_reconfig);
+	    if (rv) {
+		netcon->remote_fixed = false;
+		close(netcon->fd);
+		netcon->fd = -1;
+		eout->out(eout,
+			  "Unable to set up port for remote address '%s'",
+			  r->name);
+	    }
+	}
+
+	return;
+    }
+
+    eout->out(eout, "Too many remote addresses specified for the"
+	      " max-connections given");
+}
+
 /* Start monitoring for connections on a specific port. */
 static int
-startup_port(struct absout *eout, port_info_t *port)
+startup_port(struct absout *eout, port_info_t *port, bool is_reconfig)
 {
     void (*readhandler)(int, void *) = handle_accept_port_read;
 
@@ -2351,7 +2462,7 @@ startup_port(struct absout *eout, port_info_t *port)
 	} else {
 	    port->acceptfds = NULL;
 	    port->netcons[0].fd = 0; /* stdin */
-	    if (setup_port(port, &(port->netcons[0])) == -1)
+	    if (setup_port(port, &(port->netcons[0]), false) == -1)
 		return -1;
 	}
 	return 0;
@@ -2370,6 +2481,14 @@ startup_port(struct absout *eout, port_info_t *port)
 		   port->portname, strerror(errno));
 
 	return -1;
+    }
+
+    while (port->remaddrs) {
+	struct port_remaddr *r = port->remaddrs;
+
+	port->remaddrs = r->next;
+	process_remaddr(eout, port, r, is_reconfig);
+	free(r);
     }
 
     return 0;
@@ -2393,7 +2512,8 @@ redo_port_handlers(port_info_t *port)
 }
 
 int
-change_port_state(struct absout *eout, port_info_t *port, int state)
+change_port_state(struct absout *eout, port_info_t *port, int state,
+		  bool is_reconfig)
 {
     int rv = 0;
 
@@ -2426,7 +2546,7 @@ change_port_state(struct absout *eout, port_info_t *port, int state)
 	    port->io.read_disabled = 1;
 	else
 	    port->io.read_disabled = 0;
-	rv = startup_port(eout, port);
+	rv = startup_port(eout, port, is_reconfig);
 	port->enabled = state;
 	UNLOCK(port->lock);
     }
@@ -2437,6 +2557,13 @@ change_port_state(struct absout *eout, port_info_t *port, int state)
 static void
 free_port(port_info_t *port)
 {
+    while (port->remaddrs) {
+	struct port_remaddr *r = port->remaddrs;
+
+	port->remaddrs = r->next;
+	free(r);
+    }
+
     FREE_LOCK(port->lock);
     if (port->dev_to_net.buf)
 	free(port->dev_to_net.buf);
@@ -2516,7 +2643,7 @@ switchout_port(struct absout *eout, port_info_t *new_port,
     new_port->next = curr->next;
     UNLOCK(curr->lock);
     free_port(curr);
-    change_port_state(eout, new_port, new_state); /* releases lock */
+    change_port_state(eout, new_port, new_state, true); /* releases lock */
 }
 
 static void
@@ -2767,7 +2894,7 @@ got_timeout(selector_t  *sel,
 
     if (port->timeout) {
 	for_each_connection(port, netcon) {
-	    if (netcon->fd == -1)
+	    if (netcon->fd == -1 || netcon->remote_fixed)
 		continue;
 	    netcon->timeout_left--;
 	    if (netcon->timeout_left < 0) {
@@ -2825,6 +2952,80 @@ static int cmpstrint(const char *s, const char *prefix, int *val,
 	return -1;
     }
     return 1;
+}
+
+static void
+port_add_one_remaddr(struct absout *eout, port_info_t *port, char *str)
+{
+    struct port_remaddr *r, *r2;
+    struct addrinfo *ai = NULL;
+    bool is_dgram, is_port_set;
+    int rv;
+
+    rv = scan_network_port(str, &ai, &is_dgram, &is_port_set);
+    if (rv) {
+	eout->out(eout, "Invalid remote address '%s'", str);
+	goto out;
+    }
+
+    if (port->dgram != is_dgram) {
+	eout->out(eout, "Remote address '%s' does not match the port"
+		  " type, one cannot be UDP while the other is UDP.", str);
+	goto out;
+    }
+
+    r = malloc(sizeof(*r));
+    if (!r) {
+	eout->out(eout, "Out of memory allocation remote address");
+	goto out;
+    }
+
+    r->name = strdup(str);
+    if (!r->name) {
+	eout->out(eout, "Out of memory allocation remote address string");
+	free(r);
+	goto out;
+    }
+
+    memcpy(&r->addr, ai->ai_addr, ai->ai_addrlen);
+    r->addrlen = ai->ai_addrlen;
+    r->is_port_set = is_port_set;
+    r->next = NULL;
+
+    r2 = port->remaddrs;
+    if (!r2) {
+	port->remaddrs = r;
+    } else {
+	while (r2->next)
+	    r2 = r2->next;
+	r2->next = r;
+    }
+
+ out:
+    if (ai)
+	freeaddrinfo(ai);
+}
+
+static void
+port_add_remaddr(struct absout *eout, port_info_t *port, const char *istr)
+{
+    char *str;
+    char *strtok_data;
+    char *remstr;
+
+    str = strdup(istr);
+    if (!str) {
+	eout->out(eout, "Out of memory handling remote address '%s'", istr);
+	return;
+    }
+
+    remstr = strtok_r(str, ";", &strtok_data);
+    /* Note that we ignore an empty remaddr. */
+    while (remstr && *remstr) {
+	port_add_one_remaddr(eout, port, remstr);
+	remstr = strtok_r(NULL, ";", &strtok_data);
+    }
+    free(str);
 }
 
 static int
@@ -2936,6 +3137,8 @@ myconfig(void *data, struct absout *eout, const char *pos)
 	if (val < 1)
 	    val = 1;
 	port->max_connections = val;
+    } else if (cmpstrval(pos, "remaddr=", &end)) {
+	port_add_remaddr(eout, port, pos + end);
     } else if ((s = find_str(pos, &stype, &len))) {
 	/* It's a startup banner, signature or open/close string, it's
 	   already set. */
@@ -3140,7 +3343,7 @@ portconfig(struct absout *eout,
        would affect a port replacement here. */
 
     if (new_port->enabled != PORT_DISABLED) {
-	if (startup_port(eout, new_port) == -1)
+	if (startup_port(eout, new_port, false) == -1)
 	    goto errout_unlock;
     }
 
@@ -3180,7 +3383,8 @@ clear_old_port_config(int curr_config)
 	    /* The port was removed, remove it. */
 	    LOCK(curr->lock);
 	    if (curr->dev_to_net_state == PORT_UNCONNECTED) {
-		change_port_state(NULL, curr, PORT_DISABLED); /* releases lock*/
+		/* releases lock*/
+		change_port_state(NULL, curr, PORT_DISABLED, false);
 		if (prev == NULL) {
 		    ports = curr->next;
 		    free_port(curr);
@@ -3192,7 +3396,8 @@ clear_old_port_config(int curr_config)
 		}
 	    } else {
 		curr->config_num = -1;
-		change_port_state(NULL, curr, PORT_DISABLED); /* releases lock*/
+		/* releases lock*/
+		change_port_state(NULL, curr, PORT_DISABLED, false);
 		prev = curr;
 		curr = curr->next;
 		if (curr->dgram)
@@ -3540,7 +3745,7 @@ setportenable(struct controller_info *cntlr, char *portspec, char *enable)
 	goto out_unlock;
     }
 
-    change_port_state(&eout, port, new_enable); /* releases lock */
+    change_port_state(&eout, port, new_enable, false); /* releases lock */
     return;
 
  out_unlock:
@@ -3864,7 +4069,7 @@ shutdown_ports(void)
 	port->config_num = -1;
 	next = port->next;
 	LOCK(port->lock);
-	change_port_state(NULL, port, PORT_DISABLED);
+	change_port_state(NULL, port, PORT_DISABLED, false);
 	shutdown_port(port, "program shutdown");
 	port = next;
     }
