@@ -97,8 +97,6 @@ struct net_info {
     bool remote_fixed;			/* Tells if the remote address was
 					   set in the configuration, and
 					   cannot be changed. */
-    bool remote_fixed_port_set;		/* Do port comparison on remote
-					   addresses? */
     struct sockaddr_storage remote;	/* The socket address of who
 					   is connected to this port. */
     struct sockaddr *raddr;		/* Points to remote, for convenience. */
@@ -136,7 +134,6 @@ struct port_remaddr
     char *name;
     struct sockaddr_storage addr;
     socklen_t addrlen;
-    int netcon_num;
     bool is_port_set;
     struct port_remaddr *next;
 };
@@ -2217,28 +2214,29 @@ handle_accept_port_read(int fd, void *data)
 	return;
     }
 
+    if (port->remaddrs) {
+	struct port_remaddr *r = port->remaddrs;
+
+	while (r) {
+	    if (sockaddr_equal((struct sockaddr *) &addr, addrlen,
+			       (struct sockaddr *) &r->addr, r->addrlen,
+			       r->is_port_set))
+		break;
+	}
+	if (!r) {
+	    err = "Access denied";
+	    goto out_err;
+	}
+    }
+
     for (i = 0; i < port->max_connections; i++) {
-	if (port->netcons[i].remote_fixed &&
-	    sockaddr_equal((struct sockaddr *) &addr, addrlen,
-			   port->netcons[i].raddr, port->netcons[i].raddrlen,
-			   port->netcons[i].remote_fixed_port_set))
+	if (port->netcons[i].fd == -1)
 	    break;
     }
 
     if (i == port->max_connections) {
-	for (i = 0; i < port->max_connections; i++) {
-	    if (port->netcons[i].fd == -1 && !port->netcons[i].remote_fixed)
-		break;
-	}
-    }
-
-    if (i == port->max_connections) {
 	if (port->kickolduser_mode) {
-	    /* Only shutdown non-fixed netcons. */
 	    for (i = 0; i < port->max_connections; i++) {
-		if (port->netcons[i].remote_fixed)
-		    continue;
-
 		shutdown_one_netcon(&(port->netcons[i]),
 				    "kicked off, new user is coming\r\n");
 		/* Wait it to be unconnected and clean, go back to main loop. */
@@ -2253,6 +2251,7 @@ handle_accept_port_read(int fd, void *data)
 	err = "Port's device already in use\r\n";
 
     if (err != NULL) {
+    out_err:
 	UNLOCK(port->lock);
 	write_ignore_fail(new_fd, err, strlen(err));
 	close(new_fd);
@@ -2316,19 +2315,25 @@ udp_port_read(int fd, port_info_t *port, int *readerr, net_info_t **rnetcon)
 	goto out;
     }
 
-    /* No matching port. */
-    for (i = 0; i < port->max_connections; i++) {
-	if (!port->netcons[i].remote_fixed)
-	    continue;
-	if (sockaddr_equal((struct sockaddr *) &remaddr, remaddrlen,
-			   port->netcons[i].raddr, port->netcons[i].raddrlen,
-			   port->netcons[i].remote_fixed_port_set))
-	    break;
+    /* No matching port, try a new connection. */
+    if (port->remaddrs) {
+	struct port_remaddr *r = port->remaddrs;
+
+	while (r) {
+	    if (sockaddr_equal((struct sockaddr *) &remaddr, remaddrlen,
+			       (struct sockaddr *) &r->addr, r->addrlen,
+			       r->is_port_set))
+		break;
+	}
+	if (!r) {
+	    err = "Access denied";
+	    goto out_err;
+	}
     }
 
     if (i == port->max_connections) {
 	for (i = 0; i < port->max_connections; i++) {
-	    if (port->netcons[i].fd == -1 && !port->netcons[i].remote_fixed)
+	    if (port->netcons[i].fd == -1)
 		break;
 	}
     }
@@ -2347,6 +2352,7 @@ udp_port_read(int fd, port_info_t *port, int *readerr, net_info_t **rnetcon)
 	err = "Port's device already in use\r\n";
 
     if (!err) {
+    out_err:
 	netcon = &(port->netcons[i]);
 	if (netcon->fd == -1) {
 	    netcon->fd = dup(fd);
@@ -2395,56 +2401,50 @@ process_remaddr(struct absout *eout, port_info_t *port, struct port_remaddr *r,
 {
     net_info_t *netcon;
 
+    if (!r->is_port_set || !port->dgram)
+	return;
+
     for_each_connection(port, netcon) {
 	int i = 0;
 
 	if (netcon->remote_fixed)
 	    continue;
-	if (port->dgram) {
-	    /* Search for a UDP port that matchis the remote address family. */
-	    for (i = 0; i < port->nr_acceptfds; i++) {
-		if (port->acceptfds[i].family == r->addr.ss_family)
-		    break;
-	    }
-	    if (i == port->nr_acceptfds) {
-		eout->out(eout, "remote address '%s' had no socket with"
-			  " a matching family", r->name);
-		return;
-	    }
+
+	/* Search for a UDP port that matchis the remote address family. */
+	for (i = 0; i < port->nr_acceptfds; i++) {
+	    if (port->acceptfds[i].family == r->addr.ss_family)
+		break;
+	}
+	if (i == port->nr_acceptfds) {
+	    eout->out(eout, "remote address '%s' had no socket with"
+		      " a matching family", r->name);
+	    return;
 	}
 
 	netcon->remote_fixed = true;
 	memcpy(netcon->raddr, &r->addr, r->addrlen);
 	netcon->raddrlen = r->addrlen;
-	netcon->remote_fixed_port_set = r->is_port_set;
 
-	/* If the port is set, we can go ahead and transmit packets. */
-	if (port->dgram && netcon->remote_fixed_port_set) {
-	    int rv;
+	netcon->fd = dup(port->acceptfds[i].fd);
+	if (netcon->fd == -1) {
+	    eout->out(eout,
+		      "Unable to duplicate fd for remote address '%s'",
+		      r->name);
+	    return;
+	}
 
-	    netcon->fd = dup(port->acceptfds[i].fd);
-	    if (netcon->fd == -1) {
-		eout->out(eout,
-			  "Unable to duplicate fd for remote address '%s'",
-			  r->name);
-		return;
-	    }
-
-	    rv = setup_port(port, netcon, is_reconfig);
-	    if (rv) {
-		netcon->remote_fixed = false;
-		close(netcon->fd);
-		netcon->fd = -1;
-		eout->out(eout,
-			  "Unable to set up port for remote address '%s'",
-			  r->name);
-	    }
+	if (setup_port(port, netcon, is_reconfig)) {
+	    netcon->remote_fixed = false;
+	    close(netcon->fd);
+	    netcon->fd = -1;
+	    eout->out(eout, "Unable to set up port for remote address '%s'",
+		      r->name);
 	}
 
 	return;
     }
 
-    eout->out(eout, "Too many remote addresses specified for the"
+    eout->out(eout, "Too many fixed UDP remote addresses specified for the"
 	      " max-connections given");
 }
 
@@ -2453,6 +2453,7 @@ static int
 startup_port(struct absout *eout, port_info_t *port, bool is_reconfig)
 {
     void (*readhandler)(int, void *) = handle_accept_port_read;
+    struct port_remaddr *r;
 
     if (port->is_stdio) {
 	if (is_device_already_inuse(port)) {
@@ -2483,13 +2484,8 @@ startup_port(struct absout *eout, port_info_t *port, bool is_reconfig)
 	return -1;
     }
 
-    while (port->remaddrs) {
-	struct port_remaddr *r = port->remaddrs;
-
-	port->remaddrs = r->next;
+    for (r = port->remaddrs; r; r = r->next)
 	process_remaddr(eout, port, r, is_reconfig);
-	free(r);
-    }
 
     return 0;
 }
@@ -2860,6 +2856,7 @@ shutdown_one_netcon(net_info_t *netcon, char *reason)
 {
     port_info_t *port = netcon->port;
 
+    /* FIXME - how to handle if it's a fixed UDP port. */
     if (netcon->closing)
 	return 0;
 
