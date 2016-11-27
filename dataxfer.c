@@ -2103,6 +2103,7 @@ add_rotator(char *portname, char *ports, int lineno)
 {
     rotator_t *rot;
     int rv;
+    bool is_port_set;
 
     rot = malloc(sizeof(*rot));
     if (!rot)
@@ -2126,9 +2127,13 @@ add_rotator(char *portname, char *ports, int lineno)
     if (rv)
 	goto out;
 
-    rv = scan_network_port(rot->portname, &rot->ai, NULL);
+    rv = scan_network_port(rot->portname, &rot->ai, NULL, &is_port_set);
     if (rv) {
 	syslog(LOG_ERR, "port number was invalid on line %d", lineno);
+	goto out;
+    }
+    if (!is_port_set) {
+	syslog(LOG_ERR, "port number was zero on line %d", lineno);
 	goto out;
     }
 
@@ -2262,8 +2267,9 @@ udp_port_read(int fd, port_info_t *port, int *readerr, net_info_t **rnetcon)
     for (i = 0; i < port->max_connections; i++) {
 	if (port->netcons[i].fd == -1)
 	    continue;
-	if (!sockaddr_equal(port->netcons[i].raddr, port->netcons[i].raddrlen,
-			    (struct sockaddr *) &remaddr, remaddrlen))
+	if (!sockaddr_equal((struct sockaddr *) &remaddr, remaddrlen,
+			    port->netcons[i].raddr, port->netcons[i].raddrlen,
+			    true))
 	    continue;
 
 	/* We found a matching port. */
@@ -2974,6 +2980,7 @@ portconfig(struct absout *eout,
     port_info_t *new_port, *curr, *prev;
     enum str_type str_type;
     int i;
+    bool is_port_set;
 
     new_port = malloc(sizeof(port_info_t));
     if (new_port == NULL) {
@@ -3042,8 +3049,12 @@ portconfig(struct absout *eout,
     if (isallzero(new_port->portname)) {
 	new_port->is_stdio = 1;
     } else if (scan_network_port(new_port->portname, &new_port->ai,
-				 &new_port->dgram)) {
+				 &new_port->dgram, &is_port_set)) {
 	eout->out(eout, "port number was invalid");
+	goto errout;
+    }
+    if (!is_port_set) {
+	eout->out(eout, "port number was zero");
 	goto errout;
     }
 
